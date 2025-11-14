@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  svitlo-bot:
+    build: .
+    container_name: svitlo-bot
+    env_file:
+      - .env
+    volumes:
+      - ./base.db:/app/base.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import bot; print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# Usage:
+#   docker compose up -d        (Docker Compose plugin)
+#   docker-compose up -d        (legacy binary)
+#   docker compose logs -f svitlo-bot
+#   docker compose down         (stop and remove container)
