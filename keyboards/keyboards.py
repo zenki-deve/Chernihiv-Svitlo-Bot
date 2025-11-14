@@ -16,8 +16,8 @@ def main_menu() -> ReplyKeyboardMarkup:
     """Main persistent reply keyboard with frequently used actions."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Додати адресу"), KeyboardButton(text="📋 Мої дані")],
-            [KeyboardButton(text="🔄️ Перевірити зараз")],
+            [KeyboardButton(text="Додати адресу"), KeyboardButton(text="Мої дані")],
+            [KeyboardButton(text="Перевірити зараз")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
