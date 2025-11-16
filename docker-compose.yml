@@ -1,13 +1,16 @@
-version: "3.9"
-
 services:
-  svitlo-bot:
+  Cernihiv-Svitlo-Bot:
     build: .
-    container_name: svitlo-bot
+    image: chernihiv-svitlo-bot
+    container_name: chernihiv-svitlo-bot
     env_file:
       - .env
-    volumes:
-      - ./base.db:/app/base.db
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import bot; print('ok')"]
@@ -16,8 +19,20 @@ services:
       retries: 3
       start_period: 30s
 
-# Usage:
-#   docker compose up -d        (Docker Compose plugin)
-#   docker-compose up -d        (legacy binary)
-#   docker compose logs -f svitlo-bot
-#   docker compose down         (stop and remove container)
+  db:
+    image: postgres:17-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
+
+volumes:
+  postgres_data:

@@ -1,4 +1,18 @@
 .env
-*/__pycache__/
-*.pyc
 base.db
+
+# Python cache
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE configs
+.vscode/
+.idea/

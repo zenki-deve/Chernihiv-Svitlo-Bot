@@ -31,7 +31,7 @@ def subs_inline(subs: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for s in subs:
         status = "🔔" if s.get("enabled") else "🔕"
-        label = f"{status} {s['person_accnt']} | {s.get('name','')}"
+        label = f"{status} {s['person_accnt']} | {s.get('street','')}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"sub:{s['id']}")])
         
     if not rows:
@@ -46,7 +46,6 @@ def sub_actions_inline(sub: dict) -> InlineKeyboardMarkup:
     enabled = bool(sub.get("enabled"))
     rows = [
         [InlineKeyboardButton(text=("🔕 Вимкнути сповіщення" if enabled else "🔔 Увімкнути сповіщення"), callback_data=f"toggle:{sub['id']}")],
-        [InlineKeyboardButton(text="⚙️ Налаштувати інтервал", callback_data=f"interval:{sub['id']}")],
         [InlineKeyboardButton(text="🔎 Перевірити графік", callback_data=f"check:{sub['id']}")],
         [
             InlineKeyboardButton(text="🗑️ Видалити", callback_data=f"del:{sub['id']}"),

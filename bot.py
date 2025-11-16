@@ -3,15 +3,15 @@
 import logging
 import asyncio
 
-from utils.log import setup_logger
-from utils.updates import poll_loop
+from utils import setup_logger
+from utils import poll_loop
 from callback import callback_router
 from command import command_router
 from states import states_router
 from handler import handler_router
 from config import API_TOKEN
 from aiogram import Bot, Dispatcher, types
-from database import init_db
+from database import init_db, init_pool, close_pool
 
 logger = setup_logger(log_level=logging.INFO)
 
@@ -26,6 +26,7 @@ dp.include_router(handler_router)
 async def main(bot: Bot):
     """Initialize DB, register bot commands, and start polling + background loop."""
     await init_db()
+    await init_pool()
     try:
         await bot.set_my_commands([
             types.BotCommand(command="start", description="Start the bot"),
@@ -36,7 +37,13 @@ async def main(bot: Bot):
     polling = asyncio.create_task(dp.start_polling(bot))
     bg = asyncio.create_task(poll_loop(bot))
 
-    await asyncio.gather(polling, bg)
+    try:
+        await asyncio.gather(polling, bg)
+    finally:
+        try:
+            await close_pool()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     import asyncio

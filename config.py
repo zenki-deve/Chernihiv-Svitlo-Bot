@@ -35,3 +35,11 @@ def _require_env(name: str) -> str:
 
 
 API_TOKEN: str = _require_env("API_TOKEN")
+
+DB_HOST: str = _require_env("DB_HOST")
+DB_PORT: int = int(_require_env("DB_PORT"))
+DB_NAME: str = _require_env("DB_NAME")
+DB_USER: str = _require_env("DB_USER")
+DB_PASSWORD: str = _require_env("DB_PASSWORD")
+
+CACHE_SEC: int = int(_require_env("CACHE_SEC"))

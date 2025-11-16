@@ -9,19 +9,19 @@ from aiogram.fsm.context import FSMContext
 from database import list_subscriptions
 from keyboards import cancel_kb, subs_inline, main_menu
 from states import AddStreet
-from utils import format_entries
-from utils.updates import try_fetch_with_limits, extract_aData
+from utils import format_entries, try_fetch_with_limits
 
 handler_router = Router(name="handler")
 
 @handler_router.message(F.text, StateFilter(None))
 async def on_menu(message: types.Message, state: FSMContext):
     """Handle main menu button presses and manual checks."""
+    
     txt = (message.text or "").strip()
 
     if txt == "Додати адресу":
-        await state.set_state(AddStreet.waiting_name)
-        await message.answer("Введіть назву вулиці:", reply_markup=cancel_kb())
+        await state.set_state(AddStreet.waiting_person_accnt)
+        await message.answer("Введіть особовий рахунок:", reply_markup=cancel_kb())
 
     elif txt == "Мої дані":
         subs = await list_subscriptions(message.chat.id)
@@ -36,7 +36,7 @@ async def on_menu(message: types.Message, state: FSMContext):
         async with aiohttp.ClientSession() as session:
             for s in subs:
                 data, limit_msg = await try_fetch_with_limits(session, message.chat.id, s["person_accnt"], is_poll=False)
-                header = f"О/р {s['person_accnt']},\n{s.get('name','')}"
+                header = f"О/р {s['person_accnt']},\n{s.get('street','')}"
 
                 if limit_msg:
                     await message.answer(f"{header}: {limit_msg}")
@@ -45,12 +45,8 @@ async def on_menu(message: types.Message, state: FSMContext):
                 if not data:
                     await message.answer(f"{header}: не вдалося отримати дані")
                     continue
-                
-                a = extract_aData(data)
-                if not a:
-                    await message.answer(f"{header}: немає записів aData")
-                else:
-                    await message.answer(f"{header}\n\n{format_entries(a)}"[:4000])
+
+                await message.answer(f"{header}\n\n{format_entries(data)}"[:4000])
 
     else:
         await message.answer("Невідома команда. Використовуйте меню.", reply_markup=main_menu())

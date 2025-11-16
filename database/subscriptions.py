@@ -1,92 +1,183 @@
+from typing import Optional
 import json
-import aiosqlite
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+import asyncpg
+from datetime import datetime, timezone, timedelta
+from database import get_pool
 
-from .schema import DB_PATH
 
-async def add_subscription(name: str, chat_id: int, person_accnt: str) -> Optional[int]:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def add_subscription(name: str, chat_id: int, person_accnt: int, queue_code: str) -> Optional[int]:
+    """Add a new subscription for a chat and personal account.
+
+    Args:
+        name: Name of the subscription.
+        chat_id: Telegram chat ID.
+        person_accnt: Personal account identifier string.
+    Returns:
+        The ID of the newly created subscription, or None if it already exists.
+    """
+    
+    async with get_pool().acquire() as conn:
         try:
-            cur = await db.execute(
-                "INSERT OR IGNORE INTO subscriptions (name, chat_id, person_accnt, enabled) VALUES (?, ?, ?, 1)",
-                (name, chat_id, person_accnt),
+            result = await conn.fetchrow(
+                """
+                INSERT INTO subscriptions (street, chat_id, person_accnt, queue_code)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id;
+                """,
+                name,
+                chat_id,
+                person_accnt,
+                queue_code,
             )
-            await db.commit()
-            if cur.lastrowid is None:
-                async with db.execute(
-                    "SELECT id FROM subscriptions WHERE name = ? AND chat_id = ? AND person_accnt = ?",
-                    (name, chat_id, person_accnt),
-                ) as c2:
-                    row = await c2.fetchone()
-                    return row[0] if row else None
-            return int(cur.lastrowid)
-        except Exception:
+            return result["id"] if result else None
+        except asyncpg.UniqueViolationError:
             return None
-
-async def list_subscriptions(chat_id: int) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id, name, person_accnt, enabled, updated_at, poll_interval_minutes FROM subscriptions WHERE chat_id = ? ORDER BY id DESC",
-            (chat_id,),
-        ) as cur:
-            rows = await cur.fetchall()
-            return [dict(r) for r in rows]
-
+        
 async def remove_subscription(chat_id: int, sub_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("DELETE FROM subscriptions WHERE id = ? AND chat_id = ?", (sub_id, chat_id))
-        await db.commit()
-        return cur.rowcount > 0
+    """Remove a subscription for a chat and personal account.
+
+    Args:
+        chat_id: Telegram chat ID.
+        sub_id: Subscription ID.
+    Returns:
+        True if a subscription was deleted, False otherwise.
+    """
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM subscriptions
+            WHERE chat_id = $1 AND id = $2;
+            """,
+            chat_id,
+            sub_id,
+        )
+        return result.endswith("1")  # "DELETE 1" indicates one row deleted
+
+
+async def list_subscriptions(chat_id: int) -> list[dict]:
+    """List all subscriptions for a given chat.
+
+    Args:
+        chat_id: Telegram chat ID.
+    Returns:
+        List of subscription records.
+    """
+    async with get_pool().acquire() as conn:
+        result = await conn.fetch(
+            """
+            SELECT * FROM subscriptions
+            WHERE chat_id = $1;
+            """,
+            chat_id,
+        )
+        return [dict(record) for record in result]
+    
 
 async def set_subscription_enabled(chat_id: int, sub_id: int, enabled: bool) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE subscriptions SET enabled = ? WHERE id = ? AND chat_id = ?",
-            (1 if enabled else 0, sub_id, chat_id),
-        )
-        await db.commit()
-        return cur.rowcount > 0
+    """Enable or disable a subscription by ID.
 
-async def get_enabled_subscriptions() -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT id, name, chat_id, person_accnt, last_payload, poll_interval_minutes FROM subscriptions WHERE enabled = 1"
-        ) as cur:
-            rows = await cur.fetchall()
-            return [dict(r) for r in rows]
-
-async def set_subscription_interval(chat_id: int, sub_id: int, minutes: int) -> bool:
-    """Update polling interval (in minutes) for a subscription.
-
-    Enforces boundary [10, 1440]. Returns True if updated.
+    Args:
+        chat_id: Telegram chat ID.
+        sub_id: Subscription ID.
+        enabled: True to enable, False to disable.
     """
-    minutes = max(10, min(1440, minutes))
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE subscriptions SET poll_interval_minutes = ? WHERE id = ? AND chat_id = ?",
-            (minutes, sub_id, chat_id),
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE subscriptions
+            SET enabled = $1, updated_at = (NOW() AT TIME ZONE 'Europe/Kyiv')
+            WHERE id = $2 AND chat_id = $3;
+            """,
+            enabled,
+            sub_id,
+            chat_id,
         )
-        await db.commit()
-        return cur.rowcount > 0
+        return result.endswith("1")  # "UPDATE 1" indicates one row updated
 
-async def set_last_payload_for_sub(sub_id: int, payload: Dict[str, Any]) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE subscriptions SET last_payload = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(payload, ensure_ascii=False, sort_keys=True), datetime.utcnow().isoformat(), sub_id),
+async def get_subscription_by_id(sub_id: int) -> Optional[asyncpg.Record]:
+    """Get a subscription by its ID.
+
+    Args:
+        sub_id: Subscription ID.
+    Returns:
+        Subscription record or None if not found.
+    """
+    async with get_pool().acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT * FROM subscriptions
+            WHERE id = $1;
+            """,
+            sub_id,
         )
-        await db.commit()
+    
+async def get_subscription_by_details(
+    chat_id: int,
+    person_accnt: int,
+) -> Optional[dict]:
+    """Get a subscription by its details.
 
-async def get_last_payload_for_sub(sub_id: int) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT last_payload FROM subscriptions WHERE id = ?", (sub_id,)) as cur:
-            row = await cur.fetchone()
-            if not row or not row[0]:
-                return None
+    Args:
+        chat_id: Telegram chat ID.
+        person_accnt: Personal account identifier string.
+    Returns:
+        Subscription record or None if not found.
+    """
+    async with get_pool().acquire() as conn:
+        result = await conn.fetchrow(
+            """
+            SELECT * FROM subscriptions
+            WHERE chat_id = $1 AND person_accnt = $2;
+            """,
+            chat_id,
+            person_accnt,
+        )
+        return dict(result) if result else None
+    
+async def update_subscription_payload(
+    sub_id: int,
+    hour_count: int,
+    hour_reset_at: datetime,
+    payload: Optional[list[dict]],
+) -> bool:
+    """Update the last payload of a subscription.
+
+    Args:
+        sub_id: Subscription ID.
+        hour_count: Number of requests made in the current hour.
+        hour_reset_at: Datetime when the hourly count resets.
+        payload: New payload JSON payload (full dict from API).
+    """
+    async with get_pool().acquire() as conn:
+        payload_str = json.dumps(payload, ensure_ascii=False)
+        result = await conn.execute(
+            """
+            UPDATE subscriptions
+            SET last_payload = ($1::jsonb), hour_count = $2, hour_reset_at = $3, updated_at = (NOW() AT TIME ZONE 'Europe/Kyiv')
+            WHERE id = $4;
+            """,
+            payload_str,
+            hour_count,
+            hour_reset_at,
+            sub_id,
+        )
+        return result.endswith("1")  # "UPDATE 1" indicates one row updated
+
+async def list_chat_ids_by_queue(queue_code: str) -> list[int]:
+    """Return distinct chat IDs subscribed to a queue (enabled only)."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT chat_id
+            FROM subscriptions
+            WHERE enabled = TRUE AND queue_code = $1
+            """,
+            queue_code,
+        )
+        out: list[int] = []
+        for r in rows:
             try:
-                return json.loads(row[0])
+                out.append(int(r["chat_id"]))
             except Exception:
-                return None
+                pass
+        return out

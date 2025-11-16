@@ -1,39 +1,32 @@
-"""Updates orchestration: caching, hourly rate limits, and background polling.
+"""Utility helpers for handling updates and polling logic."""
 
-This module centralizes the logic for:
-- Enforcing per-(chat_id, person_accnt) request budgets (5/hour) with
-    single-window notifications during automated polling.
-- Sharing a short-lived cache per person_accnt to deduplicate upstream calls
-    across users and handlers.
-- Periodically polling all enabled subscriptions, grouping by account to avoid
-    redundant network requests, and broadcasting only meaningful changes.
-
-Public functions
-----------------
-- try_fetch_with_limits: Fetches account data with cache and limits applied.
-- poll_loop: Long-running background task that polls and notifies subscribers.
-"""
 import aiohttp
+import json
 import asyncio
 from aiogram import Bot
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, Dict, Any
 
-from utils import format_entries
-from utils.request import fetch_status, extract_aData, diff_payload
+from config import CACHE_SEC
+from utils import format_daily_schedule
+from utils.request import fetch_status, fetch_schedule
 from database import (
-    consume_request_budget,
-    mark_limit_notified, 
-    get_cached_account, 
-    set_cached_account,
-    get_enabled_subscriptions,
-    set_last_payload_for_sub,
-    get_last_payload_for_sub,
+    get_subscription_by_details,
+    update_subscription_payload,
+    upsert_fetch_schedule,
+    list_queues_with_payload_for_date,
+    list_chat_ids_by_queue,
 )
 
+def _kyiv_tz():
+    try:
+        return ZoneInfo("Europe/Kyiv")
+    except Exception:
+        return timezone.utc
 
-def _build_limit_message(person_accnt: str, hour_reset_at: Optional[str]) -> str:
+
+def _build_limit_message(person_accnt: int, hour_reset_at: Optional[str]) -> str:
     """Build a localized message for exceeded hourly limit.
 
     Args:
@@ -59,132 +52,124 @@ def _build_limit_message(person_accnt: str, hour_reset_at: Optional[str]) -> str
 async def try_fetch_with_limits(
     session: aiohttp.ClientSession,
     chat_id: int,
-    person_accnt: str,
+    person_accnt: int,
     *,
     is_poll: bool = False,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Fetch account data with shared cache and rate limits applied.
+) -> Tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """Try to fetch status for a personal account, respecting subscription limits and cache.
 
-    Contract
-    - Input:
-        session: An aiohttp session to reuse connections.
-        chat_id: Telegram chat identifier to apply the request budget.
-        person_accnt: The account code to fetch.
-        is_poll: If True, send only one notification per window when a limit is hit.
-    - Output:
-        Returns a tuple (payload, error_message):
-          - payload: Dict with upstream response on success, or None on error/limit.
-          - error_message: Localized text to show to the user if a limit is exceeded;
-            None when no message should be shown (e.g., already notified in-window).
-    - Behavior:
-        1) Uses a per-account cache (TTL 300s) to avoid redundant upstream calls.
-          2) Enforces 5/hour per (chat_id, person_accnt) request budgets.
-          3) During automated polling (is_poll=True), ensures only a single message is
-              sent per hourly window about exceeded limits.
+    Args:
+        session: Shared aiohttp client session.
+        chat_id: Chat ID of the requesting user.
+        person_accnt: Personal account identifier.
+        is_poll: Whether this fetch is part of the polling loop (no limit checks).
+
+    Returns:
+        A tuple of (data payload dict when successful, otherwise None, limit message when limit exceeded, otherwise None).
     """
-    now_utc = datetime.utcnow()
+    kyiv = _kyiv_tz()
+    now_kyiv = datetime.now(kyiv)
 
-    CACHE_TTL_SEC = 300
-    cached = await get_cached_account(person_accnt)
-    if cached:
-        updated_at_raw = cached.get("updated_at")
-        try:
-            updated_dt = datetime.fromisoformat(updated_at_raw) if updated_at_raw else None
-        except Exception:
-            updated_dt = None
-        if updated_dt and (now_utc - updated_dt).total_seconds() < CACHE_TTL_SEC:
-            return cached.get("payload"), None
-    res = await consume_request_budget(chat_id, person_accnt, now_utc)
-    if not res.get("ok"):
-        hour_reset_at = res.get("hour_reset_at")
-        msg = _build_limit_message(person_accnt, hour_reset_at)
-        if is_poll:
-            already_hour = bool(res.get("hour_notified"))
-            if already_hour:
-                return None, None
-            await mark_limit_notified(chat_id, person_accnt, "hour")
-            return None, msg
-        return None, msg
+    sub = await get_subscription_by_details(chat_id, person_accnt)
+    if sub is None:
+        
+        if not is_poll:
+            data_direct = await fetch_status(session, str(person_accnt))
+            return data_direct, None
+        return None, None
+    
+    cached_payload: Optional[Dict[str, Any]] = sub.get("last_payload") if sub.get("last_payload") else None
+    updated_at: Optional[datetime] = sub.get("updated_at")
 
-    data = await fetch_status(session, person_accnt)
+    if updated_at is not None:
+        if (now_kyiv - updated_at).total_seconds() < CACHE_SEC and cached_payload is not None:
+            return cached_payload, None
+        
+    count: Optional[int] = sub.get("hour_count")
+    reset_at: Optional[datetime] = sub.get("hour_reset_at")
+
+    if reset_at is None or now_kyiv >= reset_at:
+        count = 0
+        reset_at = now_kyiv + timedelta(hours=1)
+
+    if (count or 0) >= 10:
+        limit_msg = _build_limit_message(person_accnt, reset_at.isoformat() if reset_at else None)
+        return None, limit_msg
+
+    data = await fetch_status(session, str(person_accnt))
     if data:
-        await set_cached_account(person_accnt, data)
+        await update_subscription_payload(
+            sub_id=sub["id"],
+            hour_count=(count or 0) + 1,
+            hour_reset_at=reset_at,
+            payload=data,
+        )
     return data, None
 
 
 async def poll_loop(bot: Bot) -> None:
-    """Dynamic background polling loop.
+    """Background polling loop to check for schedule updates and notify users.
 
-    Interval semantics:
-      Each subscription can specify poll_interval_minutes (10-1440, default 30).
-      For a given person_accnt shared by multiple users, the loop uses the
-      minimum interval among its enabled subscriptions (clamped to [10, 1440])
-      so that frequent subscribers benefit without over-polling the upstream.
+    Args:
+        bot: The aiogram Bot instance to send messages.
 
-    Fetch decision:
-      We reuse the account cache timestamp (updated_at) to decide whether the
-      effective interval has elapsed. If not elapsed, the account is skipped.
-
-    Tick cadence:
-      The loop wakes every BASE_SLEEP (5 minutes) to evaluate due accounts. This
-      keeps resource usage modest while respecting short intervals like 10 min.
+    Returns:
+        None
     """
-    BASE_SLEEP = 600  # 10 minutes tick
+    BASE_SLEEP = 600  # 10 minutes tick to catch updates without spamming
+    kyiv = _kyiv_tz()
+
     while True:
-        start_cycle = datetime.utcnow()
+
+        now_kyiv = datetime.now(kyiv)
+
         try:
-            enabled = await get_enabled_subscriptions()
-            if not enabled:
+            if now_kyiv.hour >= 21:
+                now_kyiv += timedelta(days=1)
+            schedule_date = now_kyiv.date()
+            today_str = schedule_date.strftime("%Y-%m-%d")
+            queues = await list_queues_with_payload_for_date(schedule_date)
+            
+            if not queues:
                 await asyncio.sleep(BASE_SLEEP)
                 continue
-            by_account: dict[str, list[dict[str, Any]]] = {}
-            for row in enabled:
-                by_account.setdefault(row["person_accnt"], []).append(row)
+
             async with aiohttp.ClientSession() as session:
-                for person_accnt, subs_rows in by_account.items():
-                    raw_intervals = [int(r.get("poll_interval_minutes") or 30) for r in subs_rows]
-                    effective = min(raw_intervals) if raw_intervals else 30
-                    effective = max(10, min(1440, effective))  # clamp
-                    cached = await get_cached_account(person_accnt)
-                    should_fetch = True
+                for row in queues:
+                    queue_code = row.get("queue_code")
+                    payload = row.get("payload")
 
-                    if cached:
-                        updated_raw = cached.get("updated_at")
+                    if isinstance(payload, str):
                         try:
-                            updated_dt = datetime.fromisoformat(updated_raw) if updated_raw else None
+                            payload = json.loads(payload)
                         except Exception:
-                            updated_dt = None
+                            pass
 
-                        if updated_dt:
-                            elapsed = (start_cycle - updated_dt).total_seconds() / 60.0
-                            if elapsed < effective:
-                                should_fetch = False
-
-                    if not should_fetch:
+                    if queue_code is None:
                         continue
 
-                    representative_chat = subs_rows[0]["chat_id"]
-                    data, limit_msg = await try_fetch_with_limits(session, representative_chat, person_accnt, is_poll=True)
-
-                    if limit_msg:
-                        for r in subs_rows:
-                            await bot.send_message(chat_id=r["chat_id"], text=limit_msg)
+                    sched = await fetch_schedule(session, queue_code, today_str)
+                    if not isinstance(sched, dict) or not sched:
                         continue
 
-                    if data is None:
-                        continue
-                    
-                    for r in subs_rows:
-                        sub_id = r["id"]
-                        old = await get_last_payload_for_sub(sub_id)
-                        if old != data:
-                            a = extract_aData(data)
-                            header = f"О/р {person_accnt},\n{r.get('name','')}"
-                            body_core = format_entries(a) if a else diff_payload(old, data)
-                            body = f"{header}\n\n{body_core}" if body_core else header
-                            await bot.send_message(chat_id=r["chat_id"], text=body[:4000])
-                            await set_last_payload_for_sub(sub_id, data)
-        except Exception:
-            pass
+                    if payload != sched:
+                        await upsert_fetch_schedule(queue_code, schedule_date, sched)
+                        try:
+                            aData_list: list[Dict[str, Any]] = sched.get("aData", [])
+                            aState_map: Dict[str, Dict[str, Any]] = sched.get("aState", {})
+                            body_core = format_daily_schedule(aData_list, aState_map) if aData_list else "Розклад відсутній"
+                            header = f"Графік на {today_str} для черги {queue_code}"
+                            text = f"{header}\n\n{body_core}"
+                            chat_ids = await list_chat_ids_by_queue(queue_code)
+                            for cid in chat_ids:
+                                try:
+                                    await bot.send_message(chat_id=cid, text=text[:4000])
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+        except Exception as ex:
+            print(f"Exception in poll loop: {ex}")
+            
         finally:
             await asyncio.sleep(BASE_SLEEP)
