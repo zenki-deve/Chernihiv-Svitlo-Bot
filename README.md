@@ -31,19 +31,19 @@ The project is configured to run with Docker and Docker Compose, which is the ea
 3.  **Build and Run the Containers:**
     Use Docker Compose to build the images and run the services in the background.
     ```powershell
-    docker-compose up --build -d
+    docker compose up --build -d
     ```
 
 4.  **Check Logs:**
     To see the bot's logs, run:
     ```powershell
-    docker-compose logs -f Cernihiv-Svitlo-Bot
+    docker compose logs -f cernihiv-svitlo-bot
     ```
 
 5.  **Stop the Services:**
     To stop the bot and the database, run:
     ```powershell
-    docker-compose down
+    docker compose down
     ```
     The PostgreSQL data is stored in a Docker volume (`postgres_data`) and will be persisted across restarts.
 
