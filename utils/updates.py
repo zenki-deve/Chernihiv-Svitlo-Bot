@@ -157,7 +157,12 @@ async def poll_loop(bot: Bot) -> None:
                         try:
                             aData_list: list[Dict[str, Any]] = sched.get("aData", [])
                             aState_map: Dict[str, Dict[str, Any]] = sched.get("aState", {})
-                            body_core = format_daily_schedule(aData_list, aState_map) if aData_list else "Розклад відсутній"
+
+                            if aData_list:
+                                body_core = format_daily_schedule(aData_list, aState_map)
+                            else:
+                                continue                                
+
                             header = f"Графік на {today_str} для черги {queue_code}"
                             text = f"{header}\n\n{body_core}"
                             chat_ids = await list_chat_ids_by_queue(queue_code)
